@@ -161,9 +161,15 @@ jobs:
           set -euo pipefail
           REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
           sudo chmod +x "${REBUILD_DIR}/rebuild"
-          cd "${REBUILD_DIR}"
 
-          echo "▶ 执行: sudo ./rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 256/1024 -r ophub/kernel -n ${BUILDER}"
+          # ── 关键修复：tmp_dir 重定向到 /builder（LVM 大盘）──────────
+          sudo mkdir -p "${REBUILD_DIR}/build"
+          sudo mkdir -p /builder/rebuild_tmp
+          sudo ln -sfn /builder/rebuild_tmp "${REBUILD_DIR}/build/tmp_dir"
+          sudo chown -R runner:runner /builder/rebuild_tmp
+
+          cd "${REBUILD_DIR}"
+          echo "▶ 执行: sudo ./rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 512/1536 -r ophub/kernel -n ${BUILDER}"
           sudo ./rebuild \
             -b ${BOARD} \
             -k ${KERNEL} \
@@ -180,7 +186,7 @@ jobs:
           [[ -z "${PACKAGED_FILE}" ]] && { echo "::error::rebuild 未生成 .img.gz"; exit 1; }
 
           echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
-          echo "PACKAGED_STATUS=success" >> "${GITHUB_ENV}"
+          echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
 
       # ── 6. 发布 Release ──────────────────────────────────────────────
       - name: Upload to Release
