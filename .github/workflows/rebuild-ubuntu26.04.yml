@@ -2,7 +2,7 @@
 # 用途：基于【已有 rootfs tar.gz】构建 panther-x2 (RK3566) 镜像
 # rebuild 工具链已内置仓库，完全独立，不依赖外部 ophub 仓库
 #==========================================================================
-name: reBuild Ubuntu
+name: reBuild Ubuntu 26.04
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
       debian_release:
         description: "镜像版本标识 (用于 Release 命名)"
         required: false
-        default: "noble"
+        default: "resolute"
         type: choice
         options:
           - noble
@@ -159,16 +159,18 @@ jobs:
           BUILDER: ${{ inputs.builder_name }}
         run: |
           set -euo pipefail
-          REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
+
+          # ── 根本解法：把 rebuild 目录整体移到 /builder 大盘 ──────────
+          # rebuild 脚本执行时会 rm -rf tmp_dir 再 mkdir，软链接会被破坏
+          # 直接把 rebuild 目录移到大盘，让 PWD/tmp_dir 天然落在大盘上
+          sudo mv "${GITHUB_WORKSPACE}/rebuild" /builder/rebuild
+          sudo ln -sfn /builder/rebuild "${GITHUB_WORKSPACE}/rebuild"
+          sudo chown -R runner:runner /builder/rebuild
+          REBUILD_DIR="/builder/rebuild"
+
           sudo chmod +x "${REBUILD_DIR}/rebuild"
-
-          # ── 关键修复：tmp_dir 重定向到 /builder（LVM 大盘）──────────
-          sudo mkdir -p "${REBUILD_DIR}/build"
-          sudo mkdir -p /builder/rebuild_tmp
-          sudo ln -sfn /builder/rebuild_tmp "${REBUILD_DIR}/build/tmp_dir"
-          sudo chown -R runner:runner /builder/rebuild_tmp
-
           cd "${REBUILD_DIR}"
+
           echo "▶ 执行: sudo ./rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 512/1536 -r ophub/kernel -n ${BUILDER}"
           sudo ./rebuild \
             -b ${BOARD} \
@@ -187,7 +189,6 @@ jobs:
 
           echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
           echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
-
       # ── 6. 发布 Release ──────────────────────────────────────────────
       - name: Upload to Release
         uses: ncipollo/release-action@main
