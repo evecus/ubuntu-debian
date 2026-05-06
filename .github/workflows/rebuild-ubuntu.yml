@@ -120,10 +120,11 @@ jobs:
           IMG_NAME="Armbian_22.02.0-trunk_${{ inputs.debian_release }}_arm64.img"
           IMG_PATH="${IMG_DIR}/${IMG_NAME}"
 
-          # 镜像大小 = rootfs × 1.5（ext4 元数据+日志） + 512M(boot) + 512M(缓冲)
           ROOTFS_MB=$(sudo du -sm "${ROOTFS_DIR}" | awk '{print $1}')
-          IMG_MB=$(( (ROOTFS_MB * 3 / 2) + 512 + 512 ))
-          echo "▶ rootfs=${ROOTFS_MB}MiB × 1.5 + 1024M → 镜像=${IMG_MB}MiB"
+          echo "▶ rootfs 实际大小: ${ROOTFS_MB}MiB，创建 6G 稀疏镜像"
+
+          # truncate 创建稀疏文件，不实际占用磁盘空间，rsync 写多少占多少
+          sudo truncate -s 6G "${IMG_PATH}"
 
           sudo fallocate -l "${IMG_MB}M" "${IMG_PATH}"
 
