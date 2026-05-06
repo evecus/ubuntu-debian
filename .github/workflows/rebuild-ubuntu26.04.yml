@@ -177,7 +177,7 @@ jobs:
             -k ${KERNEL} \
             -a true \
             -t ${FSTYPE} \
-            -s 512/1536 \
+            -s 512/4096 \
             -r ophub/kernel \
             -n ${BUILDER}
 
