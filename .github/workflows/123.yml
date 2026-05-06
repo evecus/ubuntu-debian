@@ -142,7 +142,7 @@ jobs:
 
             # trixie 起 ntpdate 已被 ntpsec-ntpdate 取代
             NTPDATE_PKG=ntpdate
-            apt-cache show ntpdate >/dev/null 2>&1 || NTPDATE_PKG=ntpsec-ntpdate
+            apt-cache policy ntpdate 2>/dev/null | grep -q 'Candidate: (none)' && NTPDATE_PKG=ntpsec-ntpdate || true
 
             apt-get install -y \
               openssh-server sudo curl wget ca-certificates \
