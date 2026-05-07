@@ -205,9 +205,10 @@ jobs:
               u-boot-tools initramfs-tools parted \
               btrfs-progs e2fsprogs dosfstools \
               lsof file procps cron ntpdate bsdextrautils \
-              wireless-regdb rsync systemd-resolved \
+              wireless-regdb rsync \
               --no-install-recommends
             apt-get install -y wpasupplicant
+            apt-get install -y systemd-resolved --no-install-recommends
 
             # 验证关键包
             dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
