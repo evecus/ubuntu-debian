@@ -1,14 +1,20 @@
 #==========================================================================
-# 用途：单独编译 Ubuntu noble arm64 rootfs 并发布到 Release
-# 说明：编译完成后，在 build-ubuntu-amlogic.yml 的 rootfs_url 填入
-#       Release 附件链接即可跳过重新编译（节省 60-90 分钟）
-# 触发：手动 workflow_dispatch，或每月 1 日自动刷新
+# 用途：构建 panther-x2 (RK3566) Ubuntu 固件
+#
+# 两种模式（自动判断）：
+#   A. 填写 rootfs_url → 直接用现有 rootfs 执行 rebuild（快，约 5 分钟）
+#   B. 不填 rootfs_url → 先构建 rootfs 再 rebuild，同时发布 rootfs + 固件
 #==========================================================================
-name: Build Ubuntu RootFS
+name: Build Ubuntu
 
 on:
   workflow_dispatch:
     inputs:
+      rootfs_url:
+        description: "已有 rootfs tar.gz 链接（留空则自动构建 rootfs）"
+        required: false
+        default: ""
+
       ubuntu_release:
         description: "Ubuntu 版本"
         required: false
@@ -17,20 +23,36 @@ on:
         options:
           - noble
 
+      armbian_kernel:
+        description: "内核版本"
+        required: false
+        default: "6.12.y"
+        type: choice
+        options:
+          - 6.12.y
+          - 6.1.y
+
+      armbian_fstype:
+        description: "rootfs 文件系统类型"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+
       root_password:
-        description: "root 密码"
+        description: "root 密码（仅自建 rootfs 时生效）"
         required: false
         default: "1234"
-        type: string
 
       hostname:
-        description: "主机名"
+        description: "主机名（仅自建 rootfs 时生效）"
         required: false
         default: "ubuntu"
-        type: string
 
       timezone:
-        description: "时区"
+        description: "时区（仅自建 rootfs 时生效）"
         required: false
         default: "Asia/Shanghai"
         type: choice
@@ -42,22 +64,25 @@ on:
           - UTC
 
       extra_packages:
-        description: "额外安装的包（空格分隔，留空则只安装基础包）"
+        description: "额外安装的包，空格分隔（仅自建 rootfs 时生效）"
         required: false
         default: ""
-        type: string
 
+      builder_name:
+        description: "构建者签名"
+        required: false
+        default: "mybuilder"
 
 env:
   TZ: UTC
-  # Ubuntu 官方 ports 源（arm64 在 ports 上）
   UBUNTU_MIRROR: "http://ports.ubuntu.com/ubuntu-ports"
   ROOTFS_DIR: /builder/ubuntu-rootfs
+  BOARD: panther-x2
 
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    if: ${{ github.event_name == 'schedule' || github.event.repository.owner.id == github.event.sender.id }}
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
 
     steps:
       - name: Checkout
@@ -80,20 +105,34 @@ jobs:
             powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
             debootstrap \
-            openssl pigz curl wget xz-utils
+            parted e2fsprogs dosfstools btrfs-progs \
+            u-boot-tools uuid-runtime openssl pigz \
+            git curl wget xz-utils lz4 zstd pv jq rsync
           sudo -E apt-get -y autoremove --purge
           sudo -E apt-get clean
           sudo -E timedatectl set-timezone "${TZ}"
 
-          # schedule 触发时使用默认值
-          echo "UBUNTU_RELEASE=${{ inputs.ubuntu_release || 'noble' }}"  >> "${GITHUB_ENV}"
-          echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"   >> "${GITHUB_ENV}"
+          echo "UBUNTU_RELEASE=${{ inputs.ubuntu_release || 'noble' }}" >> "${GITHUB_ENV}"
+          echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"  >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname         || 'ubuntu' }}" >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
-          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"        >> "${GITHUB_ENV}"
+          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"       >> "${GITHUB_ENV}"
+
+          # 判断模式
+          ROOTFS_URL="${{ inputs.rootfs_url }}"
+          if [[ -n "${ROOTFS_URL}" ]]; then
+            echo "BUILD_ROOTFS=false" >> "${GITHUB_ENV}"
+            echo "ROOTFS_URL=${ROOTFS_URL}" >> "${GITHUB_ENV}"
+            echo "▶ 模式：使用已有 rootfs → ${ROOTFS_URL}"
+          else
+            echo "BUILD_ROOTFS=true"  >> "${GITHUB_ENV}"
+            echo "ROOTFS_URL="        >> "${GITHUB_ENV}"
+            echo "▶ 模式：自建 rootfs"
+          fi
+
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ── 2. 合并磁盘空间（/mnt + / → /builder，约 44 GB）──────────────
+      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
       - name: Create build disk
         if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -112,15 +151,13 @@ jobs:
           sudo chown -R runner:runner /builder
           echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
 
-      # ── 3. 构建 Ubuntu rootfs ─────────────────────────────────────────
+      # ── 3A. 自建 rootfs（rootfs_url 为空时执行）──────────────────────
       - name: Build Ubuntu rootfs
-        id: rootfs
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        id: build_rootfs
+        if: ${{ steps.init.outputs.status == 'success' && env.BUILD_ROOTFS == 'true' && !cancelled() }}
         run: |
           set -euo pipefail
 
-          # ── debootstrap ────────────────────────────────────────────────
-          # ubuntu-24.04-arm 是原生 arm64，无需 qemu 模拟
           echo "▶ debootstrap (${UBUNTU_RELEASE})..."
           sudo mkdir -p "${ROOTFS_DIR}"
           sudo debootstrap \
@@ -128,15 +165,11 @@ jobs:
             "${UBUNTU_RELEASE}" "${ROOTFS_DIR}" "${UBUNTU_MIRROR}/"
 
           # ── 挂载虚拟文件系统 ──────────────────────────────────────────
-          echo "▶ 挂载虚拟文件系统..."
           sudo mount -t proc /proc "${ROOTFS_DIR}/proc"
           sudo mount -t sysfs /sys "${ROOTFS_DIR}/sys"
           sudo mount --bind /dev "${ROOTFS_DIR}/dev"
           sudo mount --bind /dev/pts "${ROOTFS_DIR}/dev/pts"
-
-          # 使用 trap 确保无论脚本是否报错，最后都会执行卸载
           function cleanup {
-            echo "▶ 正在卸载虚拟文件系统..."
             sudo umount -l "${ROOTFS_DIR}/proc"    || true
             sudo umount -l "${ROOTFS_DIR}/sys"     || true
             sudo umount -l "${ROOTFS_DIR}/dev/pts" || true
@@ -144,7 +177,7 @@ jobs:
           }
           trap cleanup EXIT
 
-          # ── apt 源配置：DEB822 格式（Ubuntu 24.04 新格式）────────────
+          # ── apt 源（DEB822 格式）──────────────────────────────────────
           sudo rm -f "${ROOTFS_DIR}/etc/apt/sources.list"
           sudo tee "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources" > /dev/null << 'SOURCES_EOF'
           Types: deb
@@ -153,10 +186,8 @@ jobs:
           Components: main restricted universe multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           SOURCES_EOF
-          # 替换占位符为实际变量值
-          sudo sed -i "s|MIRROR_PLACEHOLDER|${UBUNTU_MIRROR}|g"      "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
-          sudo sed -i "s|RELEASE_PLACEHOLDER|${UBUNTU_RELEASE}|g"    "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
-          # 去除 heredoc 带来的行首缩进空格
+          sudo sed -i "s|MIRROR_PLACEHOLDER|${UBUNTU_MIRROR}|g"   "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+          sudo sed -i "s|RELEASE_PLACEHOLDER|${UBUNTU_RELEASE}|g" "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
           sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
 
           # ── 安装基础包 ────────────────────────────────────────────────
@@ -177,6 +208,12 @@ jobs:
               wireless-regdb rsync systemd-resolved \
               --no-install-recommends
             apt-get install -y wpasupplicant
+
+            # 验证关键包
+            dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
+              echo 'ERROR: 关键包安装不完整'
+              exit 1
+            }
             apt-get clean && rm -rf /var/lib/apt/lists/*
           "
 
@@ -191,7 +228,7 @@ jobs:
             "
           fi
 
-          # ── 配置：时区/Locale/Hostname ───────────────────────────────
+          # ── 时区 / locale / hostname ──────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" ln -sf "/usr/share/zoneinfo/${TZ_VAL}" /etc/localtime
           echo "${TZ_VAL}" | sudo tee "${ROOTFS_DIR}/etc/timezone" > /dev/null
           sudo chroot "${ROOTFS_DIR}" bash -c "DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata"
@@ -206,40 +243,39 @@ jobs:
           printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n' \
             "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hosts" > /dev/null
 
-          # ── SSH & 服务配置 ──────────────────────────────────────────
+          # ── SSH ───────────────────────────────────────────────────────
           sudo mkdir -p -m 0755 "${ROOTFS_DIR}/var/run/sshd"
           echo 'UG9ydCAyMgpQZXJtaXRSb290TG9naW4geWVzClBhc3N3b3JkQXV0aGVudGljYXRpb24geWVzClB1YmtleUF1dGhlbnRpY2F0aW9uIHllcwpVc2VQQU0geWVzClgxMUZvcndhcmRpbmcgbm8KUHJpbnRNb3RkIG5vCkFjY2VwdEVudiBMQU5HIExDXyoKU3Vic3lzdGVtIHNmdHAgL3Vzci9saWIvb3BlbnNzaC9zZnRwLXNlcnZlcgo=' \
             | base64 -d | sudo tee "${ROOTFS_DIR}/etc/ssh/sshd_config" > /dev/null
 
-          # 设置 Root 密码
+          # ── root 密码 ─────────────────────────────────────────────────
           ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
           sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
 
-          # ── 网络配置 (NetworkManager + netplan) ─────────────────────
+          # ── 网络（NetworkManager + netplan）──────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/NetworkManager"
           echo 'W21haW5dCnBsdWdpbnM9aWZ1cGRvd24sa2V5ZmlsZQpkaGNwPWludGVybmFsCltpZnVwZG93bl0KbWFuYWdlZD10cnVlCg==' \
             | base64 -d | sudo tee "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" > /dev/null
-
           sudo mkdir -p "${ROOTFS_DIR}/etc/netplan"
           sudo cp ubuntu/01-nm-all.yaml "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml"
           sudo chmod 600 "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml"
 
-          # 启用服务
-          sudo chroot "${ROOTFS_DIR}" systemctl enable ssh NetworkManager chrony nftables 2>/dev/null || true
+          # ── enable 服务 ───────────────────────────────────────────────
+          sudo chroot "${ROOTFS_DIR}" systemctl enable ssh
+          sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager
+          sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager-dispatcher
+          sudo chroot "${ROOTFS_DIR}" systemctl enable chrony
+          sudo chroot "${ROOTFS_DIR}" systemctl enable nftables         2>/dev/null || true
 
-          # ── Ubuntu 特有：禁用 snapd ──────────────────────────────────
+          # ── Ubuntu 特有：禁用 snapd / unattended-upgrades ────────────
           sudo chroot "${ROOTFS_DIR}" bash -c "
             systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
             apt-mark hold snapd 2>/dev/null || true
-          "
-
-          # ── Ubuntu 特有：禁用 unattended-upgrades ────────────────────
-          sudo chroot "${ROOTFS_DIR}" bash -c "
             systemctl disable unattended-upgrades.service 2>/dev/null || true
             systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
           "
 
-          # ── systemd 超时优化 ──────────────────────────────────────────
+          # ── systemd 超时 ──────────────────────────────────────────────
           SYS_CONF="${ROOTFS_DIR}/etc/systemd/system.conf"
           [[ -f "${SYS_CONF}" ]] && {
             sudo sed -i "s|^#*DefaultTimeoutStartSec.*|DefaultTimeoutStartSec=10s|g" "${SYS_CONF}"
@@ -252,7 +288,7 @@ jobs:
             sudo chmod +x "${ROOTFS_DIR}/etc/rc.local"
           fi
 
-          # ── 注入平台脚本 ─────────────────────────────────────────────
+          # ── 注入平台脚本 ──────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/ubuntu"
           sudo mkdir -p "${ROOTFS_DIR}/etc/default"
           sudo mkdir -p "${ROOTFS_DIR}/lib/systemd/system"
@@ -267,11 +303,11 @@ jobs:
           done
           sudo chmod +x "${ROOTFS_DIR}/usr/lib/ubuntu/"*
 
-          sudo cp ubuntu/ubuntu-release          "${ROOTFS_DIR}/etc/ubuntu-release"
-          sudo cp ubuntu/ubuntu-firstrun-etc     "${ROOTFS_DIR}/etc/default/ubuntu-firstrun"
-          sudo cp ubuntu/ubuntu-zram-config-etc  "${ROOTFS_DIR}/etc/default/ubuntu-zram-config"
-          sudo cp ubuntu/ubuntu-ramlog-etc       "${ROOTFS_DIR}/etc/default/ubuntu-ramlog"
-          sudo cp ubuntu/u-u                     "${ROOTFS_DIR}/usr/local/bin/u-u"
+          sudo cp ubuntu/ubuntu-release         "${ROOTFS_DIR}/etc/ubuntu-release"
+          sudo cp ubuntu/ubuntu-firstrun-etc    "${ROOTFS_DIR}/etc/default/ubuntu-firstrun"
+          sudo cp ubuntu/ubuntu-zram-config-etc "${ROOTFS_DIR}/etc/default/ubuntu-zram-config"
+          sudo cp ubuntu/ubuntu-ramlog-etc      "${ROOTFS_DIR}/etc/default/ubuntu-ramlog"
+          sudo cp ubuntu/u-u                    "${ROOTFS_DIR}/usr/local/bin/u-u"
           sudo chmod +x "${ROOTFS_DIR}/usr/local/bin/u-u"
 
           for f in systemd/ubuntu-firstrun.service \
@@ -289,13 +325,11 @@ jobs:
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-ramlog.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-resolved.service
 
-          # ── 禁用不必要的服务 ──────────────────────────────────────────
-          sudo chroot "${ROOTFS_DIR}" systemctl disable networking.service 2>/dev/null || true
+          # ── disable 不需要的服务 ──────────────────────────────────────
+          sudo chroot "${ROOTFS_DIR}" systemctl disable networking.service                2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service 2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service 2>/dev/null || true
-
-          echo "▶ ubuntu platform scripts injected"
+          sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service              2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service            2>/dev/null || true
 
           # ── uInitrd 钩子 ──────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/initramfs/post-update.d"
@@ -312,22 +346,21 @@ jobs:
             echo "update_initramfs=no" | sudo tee "${INITRAMFS_CONF}" > /dev/null
           fi
 
-          # ── fstab ────────────────────────────────────────────────────
+          # ── fstab ─────────────────────────────────────────────────────
           printf 'LABEL=ROOTFS\t/\text4\tdefaults,noatime,nodiratime,commit=600,errors=remount-ro\t0 1\n' \
             | sudo tee    "${ROOTFS_DIR}/etc/fstab" > /dev/null
           printf 'LABEL=BOOT\t/boot\tvfat\tdefaults\t0 2\n' \
             | sudo tee -a "${ROOTFS_DIR}/etc/fstab" > /dev/null
 
-          # ── 预建目录 ──────────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/modules"
 
           echo "▶ rootfs 完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ── 4. 打包 tar.gz + sha256 ───────────────────────────────────────
+      # ── 3B. 打包 rootfs tar.gz（仅自建模式）─────────────────────────
       - name: Package rootfs
-        id: package
-        if: ${{ steps.rootfs.outputs.status == 'success' && !cancelled() }}
+        id: package_rootfs
+        if: ${{ env.BUILD_ROOTFS == 'true' && steps.build_rootfs.outputs.status == 'success' && !cancelled() }}
         run: |
           set -euo pipefail
           OUT_DIR="${GITHUB_WORKSPACE}/output"
@@ -340,7 +373,6 @@ jobs:
 
           cd "${OUT_DIR}"
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
-          echo "▶ $(cat ${TARBALL}.sha256)"
 
           BUILT_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
           echo "TARBALL=${TARBALL}"       >> "${GITHUB_OUTPUT}"
@@ -348,44 +380,153 @@ jobs:
           echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
           echo "status=success"           >> "${GITHUB_OUTPUT}"
 
-      # ── 5. 发布到 Release ─────────────────────────────────────────────
-      - name: Publish to Release
+      # ── 3C. 下载已有 rootfs（填写 rootfs_url 时执行）────────────────
+      - name: Download existing rootfs
+        id: download_rootfs
+        if: ${{ env.BUILD_ROOTFS == 'false' && steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "${ROOTFS_DIR}"
+          echo "▶ 下载 rootfs: ${ROOTFS_URL}"
+          wget -q --show-progress -O /tmp/rootfs.tar.gz "${ROOTFS_URL}"
+          echo "▶ 解压..."
+          sudo tar -xf /tmp/rootfs.tar.gz -C "${ROOTFS_DIR}"
+          rm -f /tmp/rootfs.tar.gz
+          [[ -d "${ROOTFS_DIR}/etc" ]] || { echo "::error::rootfs 结构非法"; exit 1; }
+          echo "▶ 解压完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 4. 将 rootfs 打包成 Armbian 格式 img ─────────────────────────
+      - name: Pack rootfs into Armbian-format image
+        id: pack
+        if: >-
+          ${{
+            !cancelled() && (
+              (env.BUILD_ROOTFS == 'true'  && steps.build_rootfs.outputs.status == 'success') ||
+              (env.BUILD_ROOTFS == 'false' && steps.download_rootfs.outputs.status == 'success')
+            )
+          }}
+        run: |
+          set -euo pipefail
+
+          REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
+          IMG_DIR="${REBUILD_DIR}/build/output/images"
+          mkdir -p "${IMG_DIR}"
+
+          IMG_NAME="Armbian_22.02.0-trunk_${UBUNTU_RELEASE}_arm64.img"
+          IMG_PATH="${IMG_DIR}/${IMG_NAME}"
+
+          ROOTFS_MB=$(sudo du -sm "${ROOTFS_DIR}" | awk '{print $1}')
+          IMG_MB=$((ROOTFS_MB + 512 + 256))
+          echo "▶ rootfs=${ROOTFS_MB}MiB → 镜像=${IMG_MB}MiB"
+          sudo fallocate -l "${IMG_MB}M" "${IMG_PATH}"
+
+          sudo parted -s "${IMG_PATH}" mklabel msdos
+          sudo parted -s "${IMG_PATH}" mkpart primary ext4 4MiB 100%
+
+          LOOP=$(sudo losetup -P -f --show "${IMG_PATH}")
+          echo "▶ loop device: ${LOOP}"
+
+          sudo mkfs.ext4 -F -q -L "ROOTFS" -b 4096 "${LOOP}p1"
+
+          MNT=$(mktemp -d)
+          sudo mount "${LOOP}p1" "${MNT}"
+          echo "▶ 正在写入 rootfs..."
+          sudo rsync -a "${ROOTFS_DIR}/" "${MNT}/"
+          sudo sync
+          sudo umount "${MNT}"
+          sudo losetup -d "${LOOP}"
+          rmdir "${MNT}"
+
+          echo "▶ 镜像写入完成: $(du -sh ${IMG_PATH})"
+          echo "img_path=${IMG_PATH}"  >> "${GITHUB_OUTPUT}"
+          echo "img_outdir=${IMG_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "status=success"        >> "${GITHUB_OUTPUT}"
+
+      # ── 5. Rebuild：注入内核 + uboot + 平台文件 ──────────────────────
+      - name: Rebuild image
+        id: rebuild
+        if: ${{ steps.pack.outputs.status == 'success' && !cancelled() }}
+        env:
+          KERNEL: ${{ inputs.armbian_kernel }}
+          FSTYPE: ${{ inputs.armbian_fstype }}
+          BUILDER: ${{ inputs.builder_name }}
+        run: |
+          set -euo pipefail
+          REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
+          sudo chmod +x "${REBUILD_DIR}/rebuild"
+          cd "${REBUILD_DIR}"
+
+          echo "▶ 执行: sudo ./rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 256/1024 -r ophub/kernel -n ${BUILDER}"
+          sudo ./rebuild \
+            -b ${BOARD} \
+            -k ${KERNEL} \
+            -a true \
+            -t ${FSTYPE} \
+            -s 256/1024 \
+            -r ophub/kernel \
+            -n ${BUILDER}
+
+          OUTPUT_DIR="${REBUILD_DIR}/build/output/images"
+          ls -lh "${OUTPUT_DIR}/"
+
+          PACKAGED_FILE="$(ls ${OUTPUT_DIR}/*.img.gz 2>/dev/null | head -1)"
+          [[ -z "${PACKAGED_FILE}" ]] && { echo "::error::rebuild 未生成 .img.gz"; exit 1; }
+
+          echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
+          echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
+
+      # ── 6A. 发布固件 + rootfs（自建模式）────────────────────────────
+      - name: Release firmware + rootfs
         uses: ncipollo/release-action@main
-        if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
+        if: ${{ env.PACKAGED_STATUS == 'success' && env.BUILD_ROOTFS == 'true' && !cancelled() }}
         with:
-          tag: "RootFS_${{ env.UBUNTU_RELEASE }}_${{ github.run_id }}"
-          name: "Ubuntu ${{ env.UBUNTU_RELEASE }} RootFS · ${{ steps.package.outputs.BUILT_DATE }}"
+          tag: "Ubuntu_${{ env.UBUNTU_RELEASE }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}"
+          name: "Ubuntu ${{ env.UBUNTU_RELEASE }} · panther-x2 · ${{ inputs.armbian_kernel }}"
           artifacts: |
-            ${{ steps.package.outputs.OUT_DIR }}/${{ steps.package.outputs.TARBALL }}
-            ${{ steps.package.outputs.OUT_DIR }}/${{ steps.package.outputs.TARBALL }}.sha256
-          allowUpdates: false
-          makeLatest: true
+            ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*
+            ${{ steps.package_rootfs.outputs.OUT_DIR }}/${{ steps.package_rootfs.outputs.TARBALL }}
+            ${{ steps.package_rootfs.outputs.OUT_DIR }}/${{ steps.package_rootfs.outputs.TARBALL }}.sha256
+          allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            ## Ubuntu ${{ env.UBUNTU_RELEASE }} arm64 RootFS
+            ## Ubuntu ${{ env.UBUNTU_RELEASE }} for panther-x2 (RK3566)
 
-            | 项目 | 值 |
+            | 参数 | 值 |
             |------|-----|
             | Ubuntu 版本 | `${{ env.UBUNTU_RELEASE }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
             | 时区 | `${{ env.TZ_VAL }}` |
-            | 主机名 | `${{ env.HOSTNAME_VAL }}` |
-            | 构建时间 | `${{ steps.package.outputs.BUILT_DATE }}` |
-            | Run ID | `${{ github.run_id }}` |
+            | 构建时间 | `${{ steps.package_rootfs.outputs.BUILT_DATE }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
 
-            ## 在 build-ubuntu-amlogic.yml 中复用此 rootfs
+            ## 附件说明
+            - `*.img.gz` — 可直接烧录的固件
+            - `Ubuntu_*_rootfs.tar.gz` — rootfs 归档，下次构建可填入 rootfs_url 跳过 debootstrap
 
-            触发镜像构建时，在 **rootfs_url** 输入框填入以下链接，跳过 60-90 分钟的 debootstrap：
-
+            ## 复用此 rootfs
+            下次触发时在 **rootfs_url** 填入：
             ```
-            https://github.com/${{ github.repository }}/releases/download/RootFS_${{ env.UBUNTU_RELEASE }}_${{ github.run_id }}/Ubuntu_${{ env.UBUNTU_RELEASE }}_rootfs.tar.gz
+            https://github.com/${{ github.repository }}/releases/download/Ubuntu_${{ env.UBUNTU_RELEASE }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}/Ubuntu_${{ env.UBUNTU_RELEASE }}_rootfs.tar.gz
             ```
 
-            ## 内容说明
+      # ── 6B. 仅发布固件（使用已有 rootfs 模式）───────────────────────
+      - name: Release firmware only
+        uses: ncipollo/release-action@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && env.BUILD_ROOTFS == 'false' && !cancelled() }}
+        with:
+          tag: "Ubuntu_${{ env.UBUNTU_RELEASE }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}"
+          name: "Ubuntu ${{ env.UBUNTU_RELEASE }} · panther-x2 · ${{ inputs.armbian_kernel }}"
+          artifacts: "${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*"
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## Ubuntu ${{ env.UBUNTU_RELEASE }} for panther-x2 (RK3566)
 
-            - 纯净 Ubuntu `${{ env.UBUNTU_RELEASE }}` (24.04 LTS) arm64
-            - Ubuntu 官方 ports apt 源（DEB822 格式，main/restricted/universe/multiverse）
-            - 已配置：SSH root 登录、NetworkManager、en_US.UTF-8 locale、时区
-            - 已配置：uInitrd 钩子（u-boot 兼容 initramfs 格式）
-            - 已禁用：snapd、unattended-upgrades（嵌入式不需要）
-            - 已设置：`update_initramfs=no`（内核注入由 rebuild 脚本接管）
-            - fstab 使用 `LABEL=ROOTFS/BOOT` 占位符，rebuild 时替换为真实 UUID
+            | 参数 | 值 |
+            |------|-----|
+            | 来源 rootfs | `${{ inputs.rootfs_url }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
