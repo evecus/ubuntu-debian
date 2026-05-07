@@ -1,37 +1,65 @@
 #==========================================================================
-# 用途：单独编译 Ubuntu arm64 rootfs 并发布到 Release
-# 支持：noble (24.04 LTS) / resolute (26.04 LTS)
-# 说明：编译完成后，在 build-ubuntu-amlogic.yml 的 rootfs_url 填入
-#       Release 附件链接即可跳过重新编译（节省 60-90 分钟）
-# 触发：手动 workflow_dispatch
+# 用途：构建 panther-x2 (RK3566) Ubuntu 26.04 固件
+#
+# 两种模式（自动判断）：
+#   A. 提供 rootfs_url → 跳过 rootfs 构建，直接 rebuild 固件
+#   B. 不提供 rootfs_url → 先构建 rootfs（打包+发布），再 rebuild 固件
+#
+# Release 内容：
+#   模式 A → 仅发布固件 (.img.gz)
+#   模式 B → 同时发布 rootfs (.tar.gz) + 固件 (.img.gz)
 #==========================================================================
-name: Build Ubuntu RootFS 26
+name: Build Ubuntu 26.04
 
 on:
   workflow_dispatch:
     inputs:
+      rootfs_url:
+        description: "已有 rootfs tar.gz 下载地址（留空则自动构建 rootfs）"
+        required: false
+        default: ""
+
       ubuntu_release:
-        description: "Ubuntu 版本"
+        description: "Ubuntu 版本标识"
         required: false
         default: "resolute"
         type: choice
         options:
           - resolute
+          - noble
+
+      armbian_kernel:
+        description: "内核版本"
+        required: false
+        default: "6.12.y"
+        type: choice
+        options:
+          - 6.12.y
+          - 6.1.y
+
+      armbian_fstype:
+        description: "rootfs 文件系统类型"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
 
       root_password:
-        description: "root 密码"
+        description: "root 密码（仅自动构建 rootfs 时生效）"
         required: false
         default: "1234"
         type: string
 
       hostname:
-        description: "主机名"
+        description: "主机名（仅自动构建 rootfs 时生效）"
         required: false
         default: "ubuntu"
         type: string
 
       timezone:
-        description: "时区"
+        description: "时区（仅自动构建 rootfs 时生效）"
         required: false
         default: "Asia/Shanghai"
         type: choice
@@ -43,22 +71,41 @@ on:
           - UTC
 
       extra_packages:
-        description: "额外安装的包（空格分隔，留空则只安装基础包）"
+        description: "额外安装的包，空格分隔（仅自动构建 rootfs 时生效）"
         required: false
         default: ""
         type: string
 
+      builder_name:
+        description: "构建者签名"
+        required: false
+        default: "mybuilder"
 
 env:
   TZ: UTC
-  # Ubuntu 官方 ports 源（arm64 在 ports 上）
   UBUNTU_MIRROR: "http://ports.ubuntu.com/ubuntu-ports"
   ROOTFS_DIR: /builder/ubuntu-rootfs
+  BOARD: panther-x2
 
 jobs:
-  build:
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 1：构建 rootfs（仅在未提供 rootfs_url 时运行）
+  # 运行环境：ubuntu-24.04-arm（原生 arm64，无需 qemu）
+  # ════════════════════════════════════════════════════════════════════════
+  build-rootfs:
+    name: "Build RootFS (skip if URL provided)"
     runs-on: ubuntu-24.04-arm
-    if: ${{ github.event_name == 'schedule' || github.event.repository.owner.id == github.event.sender.id }}
+    if: ${{ github.event.inputs.rootfs_url == '' && github.event.repository.owner.id == github.event.sender.id }}
+    permissions:
+      contents: write
+    outputs:
+      # 供 rebuild job 读取的 rootfs 下载地址（自动构建后写入）
+      rootfs_url: ${{ steps.publish.outputs.rootfs_url }}
+      # 供 Release 合并使用的 tar.gz 路径
+      tarball_name: ${{ steps.package.outputs.tarball_name }}
+      release_tag: ${{ steps.publish.outputs.release_tag }}
+      built_date: ${{ steps.package.outputs.built_date }}
+      status: ${{ steps.rootfs.outputs.status }}
 
     steps:
       - name: Checkout
@@ -73,28 +120,25 @@ jobs:
           docker rmi -f $(docker images -q) 2>/dev/null || true
           [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
 
           sudo -E apt-get -y update
           sudo -E apt-get -y purge \
             azure-cli ghc* zulu* llvm* firefox google* dotnet* \
             powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
-            debootstrap \
-            openssl pigz curl wget xz-utils
+            debootstrap openssl pigz curl wget xz-utils
           sudo -E apt-get -y autoremove --purge
           sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
 
-          # schedule 触发时使用默认值
-          echo "UBUNTU_RELEASE=${{ inputs.ubuntu_release || 'noble' }}"  >> "${GITHUB_ENV}"
-          echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"   >> "${GITHUB_ENV}"
-          echo "HOSTNAME_VAL=${{ inputs.hostname         || 'ubuntu' }}" >> "${GITHUB_ENV}"
+          # 写入构建参数到环境
+          echo "UBUNTU_RELEASE=${{ inputs.ubuntu_release || 'resolute' }}" >> "${GITHUB_ENV}"
+          echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"     >> "${GITHUB_ENV}"
+          echo "HOSTNAME_VAL=${{ inputs.hostname         || 'ubuntu' }}"   >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
-          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"        >> "${GITHUB_ENV}"
+          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"          >> "${GITHUB_ENV}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ── 2. 合并磁盘空间（/mnt + / → /builder，约 44 GB）──────────────
+      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
       - name: Create build disk
         if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -120,8 +164,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ── debootstrap ────────────────────────────────────────────────
-          # ubuntu-24.04-arm 是原生 arm64，无需 qemu 模拟
           echo "▶ debootstrap (${UBUNTU_RELEASE})..."
           sudo mkdir -p "${ROOTFS_DIR}"
           sudo debootstrap \
@@ -129,15 +171,12 @@ jobs:
             "${UBUNTU_RELEASE}" "${ROOTFS_DIR}" "${UBUNTU_MIRROR}/"
 
           # ── 挂载虚拟文件系统 ──────────────────────────────────────────
-          echo "▶ 挂载虚拟文件系统..."
           sudo mount -t proc /proc "${ROOTFS_DIR}/proc"
           sudo mount -t sysfs /sys "${ROOTFS_DIR}/sys"
           sudo mount --bind /dev "${ROOTFS_DIR}/dev"
           sudo mount --bind /dev/pts "${ROOTFS_DIR}/dev/pts"
 
-          # 使用 trap 确保无论脚本是否报错，最后都会执行卸载
           function cleanup {
-            echo "▶ 正在卸载虚拟文件系统..."
             sudo umount -l "${ROOTFS_DIR}/proc"    || true
             sudo umount -l "${ROOTFS_DIR}/sys"     || true
             sudo umount -l "${ROOTFS_DIR}/dev/pts" || true
@@ -145,7 +184,7 @@ jobs:
           }
           trap cleanup EXIT
 
-          # ── apt 源配置：DEB822 格式（Ubuntu 24.04 新格式）────────────
+          # ── apt 源配置（DEB822 格式）─────────────────────────────────
           sudo rm -f "${ROOTFS_DIR}/etc/apt/sources.list"
           sudo tee "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources" > /dev/null << 'SOURCES_EOF'
           Types: deb
@@ -154,21 +193,17 @@ jobs:
           Components: main restricted universe multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           SOURCES_EOF
-          # 替换占位符为实际变量值
-          sudo sed -i "s|MIRROR_PLACEHOLDER|${UBUNTU_MIRROR}|g"      "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
-          sudo sed -i "s|RELEASE_PLACEHOLDER|${UBUNTU_RELEASE}|g"    "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
-          # 去除 heredoc 带来的行首缩进空格
+          sudo sed -i "s|MIRROR_PLACEHOLDER|${UBUNTU_MIRROR}|g"   "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+          sudo sed -i "s|RELEASE_PLACEHOLDER|${UBUNTU_RELEASE}|g" "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
           sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
 
+          # ── 安装基础软件包 ────────────────────────────────────────────
           echo "▶ 安装基础软件包..."
           sudo chroot "${ROOTFS_DIR}" /bin/bash -c "
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-
-            # resolute(26.04) initramfs-tools 강제 설치
             apt-get install -y dracut- initramfs-tools --no-install-recommends 2>/dev/null || \
             apt-get install -y initramfs-tools --no-install-recommends
-
             apt-get install -y \
               openssh-server sudo curl wget ca-certificates \
               locales tzdata fdisk \
@@ -183,16 +218,13 @@ jobs:
               --no-install-recommends
             apt-get install -y wpasupplicant
             apt-mark hold initramfs-tools 2>/dev/null || true
-
-            # 关键包验证，装失败立即报错
             dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
               echo 'ERROR: 关键包安装不完整'
-              dpkg -l openssh-server network-manager rsync
               exit 1
             }
             apt-get clean && rm -rf /var/lib/apt/lists/*
           "
-          
+
           # ── 额外包（可选）────────────────────────────────────────────
           if [[ -n "${EXTRA_PKGS}" ]]; then
             echo "▶ 安装额外包: ${EXTRA_PKGS}"
@@ -204,54 +236,45 @@ jobs:
             "
           fi
 
-          # ── 配置：时区/Locale/Hostname ───────────────────────────────
+          # ── 时区 / Locale / Hostname ──────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" ln -sf "/usr/share/zoneinfo/${TZ_VAL}" /etc/localtime
           echo "${TZ_VAL}" | sudo tee "${ROOTFS_DIR}/etc/timezone" > /dev/null
           sudo chroot "${ROOTFS_DIR}" bash -c "DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata"
-
           sudo chroot "${ROOTFS_DIR}" bash -c "
             sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen
             locale-gen
             echo 'LANG=en_US.UTF-8' > /etc/default/locale
           "
-
           echo "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hostname" > /dev/null
           printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n' \
             "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hosts" > /dev/null
 
-          # ── SSH & 服务配置 ──────────────────────────────────────────
+          # ── SSH 配置 ──────────────────────────────────────────────────
           sudo mkdir -p -m 0755 "${ROOTFS_DIR}/var/run/sshd"
           echo 'UG9ydCAyMgpQZXJtaXRSb290TG9naW4geWVzClBhc3N3b3JkQXV0aGVudGljYXRpb24geWVzClB1YmtleUF1dGhlbnRpY2F0aW9uIHllcwpVc2VQQU0geWVzClgxMUZvcndhcmRpbmcgbm8KUHJpbnRNb3RkIG5vCkFjY2VwdEVudiBMQU5HIExDXyoKU3Vic3lzdGVtIHNmdHAgL3Vzci9saWIvb3BlbnNzaC9zZnRwLXNlcnZlcgo=' \
             | base64 -d | sudo tee "${ROOTFS_DIR}/etc/ssh/sshd_config" > /dev/null
-
-          # 设置 Root 密码
           ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
           sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
 
-          # ── 网络配置 (NetworkManager + netplan) ─────────────────────
+          # ── 网络配置（NetworkManager + netplan）──────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/NetworkManager"
           echo 'W21haW5dCnBsdWdpbnM9aWZ1cGRvd24sa2V5ZmlsZQpkaGNwPWludGVybmFsCltpZnVwZG93bl0KbWFuYWdlZD10cnVlCg==' \
             | base64 -d | sudo tee "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" > /dev/null
-
           sudo mkdir -p "${ROOTFS_DIR}/etc/netplan"
           sudo cp ubuntu/01-nm-all.yaml "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml"
           sudo chmod 600 "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml"
 
-          # 启用服务
+          # ── 启用服务 ──────────────────────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" systemctl enable ssh
           sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager
           sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager-dispatcher
           sudo chroot "${ROOTFS_DIR}" systemctl enable chrony
           sudo chroot "${ROOTFS_DIR}" systemctl enable nftables 2>/dev/null || true
 
-          # ── Ubuntu 特有：禁用 snapd ──────────────────────────────────
+          # ── 禁用不必要服务 ────────────────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" bash -c "
             systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
             apt-mark hold snapd 2>/dev/null || true
-          "
-
-          # ── Ubuntu 特有：禁用 unattended-upgrades ────────────────────
-          sudo chroot "${ROOTFS_DIR}" bash -c "
             systemctl disable unattended-upgrades.service 2>/dev/null || true
             systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
           "
@@ -269,11 +292,10 @@ jobs:
             sudo chmod +x "${ROOTFS_DIR}/etc/rc.local"
           fi
 
-          # ── 注入平台脚本 ─────────────────────────────────────────────
+          # ── 注入平台脚本 ──────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/ubuntu"
           sudo mkdir -p "${ROOTFS_DIR}/etc/default"
           sudo mkdir -p "${ROOTFS_DIR}/lib/systemd/system"
-
           for f in ubuntu/ubuntu-firstrun \
                    ubuntu/ubuntu-ramlog \
                    ubuntu/ubuntu-common \
@@ -283,14 +305,12 @@ jobs:
             sudo cp "${f}" "${ROOTFS_DIR}/usr/lib/ubuntu/$(basename ${f})"
           done
           sudo chmod +x "${ROOTFS_DIR}/usr/lib/ubuntu/"*
-
           sudo cp ubuntu/ubuntu-release          "${ROOTFS_DIR}/etc/ubuntu-release"
           sudo cp ubuntu/ubuntu-firstrun-etc     "${ROOTFS_DIR}/etc/default/ubuntu-firstrun"
           sudo cp ubuntu/ubuntu-zram-config-etc  "${ROOTFS_DIR}/etc/default/ubuntu-zram-config"
           sudo cp ubuntu/ubuntu-ramlog-etc       "${ROOTFS_DIR}/etc/default/ubuntu-ramlog"
           sudo cp ubuntu/u-u                     "${ROOTFS_DIR}/usr/local/bin/u-u"
           sudo chmod +x "${ROOTFS_DIR}/usr/local/bin/u-u"
-
           for f in systemd/ubuntu-firstrun.service \
                    systemd/ubuntu-hardware-optimize.service \
                    systemd/ubuntu-resize-filesystem.service \
@@ -298,21 +318,16 @@ jobs:
                    systemd/ubuntu-zram-config.service; do
             sudo cp "${f}" "${ROOTFS_DIR}/lib/systemd/system/"
           done
-
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-firstrun.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-hardware-optimize.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-resize-filesystem.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-zram-config.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-ramlog.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-resolved.service
-
-          # ── 禁用不必要的服务 ──────────────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" systemctl disable networking.service 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service 2>/dev/null || true
-
-          echo "▶ ubuntu platform scripts injected"
 
           # ── uInitrd 钩子 ──────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/initramfs/post-update.d"
@@ -329,19 +344,17 @@ jobs:
             echo "update_initramfs=no" | sudo tee "${INITRAMFS_CONF}" > /dev/null
           fi
 
-          # ── fstab ────────────────────────────────────────────────────
+          # ── fstab ─────────────────────────────────────────────────────
           printf 'LABEL=ROOTFS\t/\text4\tdefaults,noatime,nodiratime,commit=600,errors=remount-ro\t0 1\n' \
             | sudo tee    "${ROOTFS_DIR}/etc/fstab" > /dev/null
           printf 'LABEL=BOOT\t/boot\tvfat\tdefaults\t0 2\n' \
             | sudo tee -a "${ROOTFS_DIR}/etc/fstab" > /dev/null
 
-          # ── 预建目录 ──────────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/modules"
-
           echo "▶ rootfs 完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ── 4. 打包 tar.gz + sha256 ───────────────────────────────────────
+      # ── 4. 打包 tar.gz ────────────────────────────────────────────────
       - name: Package rootfs
         id: package
         if: ${{ steps.rootfs.outputs.status == 'success' && !cancelled() }}
@@ -350,60 +363,233 @@ jobs:
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
 
-          TARBALL="Ubuntu_${UBUNTU_RELEASE}_rootfs.tar.gz"
+          TARBALL="Ubuntu_${UBUNTU_RELEASE}_rootfs_${{ github.run_number }}.tar.gz"
           echo "▶ 打包 → ${TARBALL} ..."
           sudo tar -czf "${OUT_DIR}/${TARBALL}" -C "${ROOTFS_DIR}" .
           echo "▶ 大小: $(du -sh ${OUT_DIR}/${TARBALL} | awk '{print $1}')"
-
           cd "${OUT_DIR}"
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
-          echo "▶ $(cat ${TARBALL}.sha256)"
 
           BUILT_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
-          echo "TARBALL=${TARBALL}"       >> "${GITHUB_OUTPUT}"
-          echo "OUT_DIR=${OUT_DIR}"       >> "${GITHUB_OUTPUT}"
-          echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
-          echo "status=success"           >> "${GITHUB_OUTPUT}"
+          echo "tarball_name=${TARBALL}"   >> "${GITHUB_OUTPUT}"
+          echo "out_dir=${OUT_DIR}"        >> "${GITHUB_OUTPUT}"
+          echo "built_date=${BUILT_DATE}"  >> "${GITHUB_OUTPUT}"
+          echo "status=success"            >> "${GITHUB_OUTPUT}"
 
-      # ── 5. 发布到 Release ─────────────────────────────────────────────
-      - name: Publish to Release
+      # ── 5. 发布 rootfs 到 Release（供 rebuild job 下载）──────────────
+      - name: Publish rootfs to Release
+        id: publish
         uses: ncipollo/release-action@main
         if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
         with:
-          tag: "RootFS_${{ env.UBUNTU_RELEASE }}_${{ github.run_id }}"
-          name: "Ubuntu ${{ env.UBUNTU_RELEASE }} RootFS · ${{ steps.package.outputs.BUILT_DATE }}"
+          tag: "Build_${{ inputs.ubuntu_release }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}"
+          name: "Ubuntu ${{ inputs.ubuntu_release }} · panther-x2 · ${{ inputs.armbian_kernel }} · #${{ github.run_number }}"
           artifacts: |
-            ${{ steps.package.outputs.OUT_DIR }}/${{ steps.package.outputs.TARBALL }}
-            ${{ steps.package.outputs.OUT_DIR }}/${{ steps.package.outputs.TARBALL }}.sha256
-          allowUpdates: false
-          makeLatest: true
+            ${{ steps.package.outputs.out_dir }}/${{ steps.package.outputs.tarball_name }}
+            ${{ steps.package.outputs.out_dir }}/${{ steps.package.outputs.tarball_name }}.sha256
+          allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            ## Ubuntu ${{ env.UBUNTU_RELEASE }} arm64 RootFS
+            ## Ubuntu ${{ inputs.ubuntu_release }} for panther-x2 (RK3566) — 构建中…
 
-            | 项目 | 值 |
+            > RootFS 已上传，正在等待固件构建完成后更新此 Release。
+
+            | 参数 | 值 |
             |------|-----|
-            | Ubuntu 版本 | `${{ env.UBUNTU_RELEASE }}` |
-            | 时区 | `${{ env.TZ_VAL }}` |
-            | 主机名 | `${{ env.HOSTNAME_VAL }}` |
-            | 构建时间 | `${{ steps.package.outputs.BUILT_DATE }}` |
-            | Run ID | `${{ github.run_id }}` |
+            | Ubuntu 版本 | `${{ inputs.ubuntu_release }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
+            | 时区 | `${{ inputs.timezone }}` |
+            | 主机名 | `${{ inputs.hostname }}` |
+            | 构建时间 | `${{ steps.package.outputs.built_date }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
 
-            ## 在 build-ubuntu-amlogic.yml 中复用此 rootfs
+      # ── 向 rebuild job 传递下载地址 ──────────────────────────────────
+      - name: Export rootfs URL for rebuild job
+        id: export_url
+        if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
+        run: |
+          TARBALL="${{ steps.package.outputs.tarball_name }}"
+          TAG="Build_${{ inputs.ubuntu_release }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${TARBALL}"
+          echo "rootfs_url=${URL}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
-            触发镜像构建时，在 **rootfs_url** 输入框填入以下链接，跳过 60-90 分钟的 debootstrap：
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 2：Rebuild 固件（inject kernel + uboot）
+  # 运行环境：ubuntu-24.04（x86_64），rebuild 工具链已内置交叉工具
+  # 依赖：build-rootfs 完成（如果是模式 B），或直接用传入的 URL（模式 A）
+  # ════════════════════════════════════════════════════════════════════════
+  rebuild-firmware:
+    name: "Rebuild Firmware"
+    runs-on: ubuntu-24.04
+    # 模式 A（有 URL）：直接运行，不等待 build-rootfs
+    # 模式 B（无 URL）：等待 build-rootfs 完成
+    needs: [build-rootfs]
+    if: |
+      always() &&
+      github.event.repository.owner.id == github.event.sender.id &&
+      (
+        github.event.inputs.rootfs_url != '' ||
+        needs.build-rootfs.result == 'success'
+      )
+    permissions:
+      contents: write
+    env:
+      # 优先用手动输入的 URL；模式 B 时使用 build-rootfs 输出的 URL
+      EFFECTIVE_ROOTFS_URL: ${{ github.event.inputs.rootfs_url != '' && github.event.inputs.rootfs_url || needs.build-rootfs.outputs.rootfs_url }}
+      # 是否为"自动构建 rootfs"模式（决定 Release 是否更新 body）
+      BUILT_ROOTFS: ${{ github.event.inputs.rootfs_url == '' }}
 
-            ```
-            https://github.com/${{ github.repository }}/releases/download/RootFS_${{ env.UBUNTU_RELEASE }}_${{ github.run_id }}/Ubuntu_${{ env.UBUNTU_RELEASE }}_rootfs.tar.gz
-            ```
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-            ## 内容说明
+      # ── 1. 初始化环境 ──────────────────────────────────────────────────
+      - name: Initialize environment
+        id: init
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install \
+            parted e2fsprogs dosfstools btrfs-progs \
+            u-boot-tools uuid-runtime openssl pigz \
+            git curl wget xz-utils lz4 zstd pv jq rsync
+          echo "status=success" >> "${GITHUB_OUTPUT}"
 
-            - 纯净 Ubuntu `${{ env.UBUNTU_RELEASE }}` arm64（noble=24.04 LTS / resolute=26.04 LTS）
-            - Ubuntu 官方 ports apt 源（DEB822 格式，main/restricted/universe/multiverse）
-            - 已配置：SSH root 登录、NetworkManager、en_US.UTF-8 locale、时区
-            - 已配置：uInitrd 钩子（u-boot 兼容 initramfs 格式）
-            - 已禁用：snapd、unattended-upgrades（嵌入式不需要）
-            - 已设置：`update_initramfs=no`（内核注入由 rebuild 脚本接管）
-            - resolute(26.04) 专项：强制使用 `initramfs-tools` 替代默认 dracut
-            - fstab 使用 `LABEL=ROOTFS/BOOT` 占位符，rebuild 时替换为真实 UUID
+      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
+      - name: Create build disk
+        if: ${{ steps.init.outputs.status == 'success' }}
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}G" /mnt/mnt.img
+          sudo truncate -s "${root_size}G" /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+
+      # ── 3. 下载并解压 rootfs ──────────────────────────────────────────
+      - name: Prepare rootfs
+        id: rootfs
+        run: |
+          set -euo pipefail
+          echo "▶ 使用 rootfs URL: ${EFFECTIVE_ROOTFS_URL}"
+          [[ -z "${EFFECTIVE_ROOTFS_URL}" ]] && { echo "::error::rootfs URL 为空，无法继续"; exit 1; }
+
+          sudo mkdir -p "${ROOTFS_DIR}"
+          echo "▶ 正在下载..."
+          wget -q --show-progress -O /tmp/rootfs.tar.gz "${EFFECTIVE_ROOTFS_URL}"
+          echo "▶ 正在解压..."
+          sudo tar -xf /tmp/rootfs.tar.gz -C "${ROOTFS_DIR}"
+          rm -f /tmp/rootfs.tar.gz
+
+          [[ -d "${ROOTFS_DIR}/etc" ]] || { echo "::error::rootfs 结构非法，缺少 /etc"; exit 1; }
+          echo "▶ 解压完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 4. 将 rootfs 打包成 Armbian-format 镜像（rebuild 的输入）─────
+      - name: Pack rootfs into Armbian-format image
+        id: pack
+        if: ${{ steps.rootfs.outputs.status == 'success' }}
+        run: |
+          set -euo pipefail
+
+          REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
+          IMG_DIR="${REBUILD_DIR}/build/output/images"
+          mkdir -p "${IMG_DIR}"
+
+          IMG_NAME="Armbian_22.02.0-trunk_${{ inputs.ubuntu_release }}_arm64.img"
+          IMG_PATH="${IMG_DIR}/${IMG_NAME}"
+
+          echo "▶ 创建 6G 稀疏镜像..."
+          sudo truncate -s 6G "${IMG_PATH}"
+          sudo parted -s "${IMG_PATH}" mklabel msdos
+          sudo parted -s "${IMG_PATH}" mkpart primary ext4 4MiB 100%
+
+          LOOP=$(sudo losetup -P -f --show "${IMG_PATH}")
+          sudo mkfs.ext4 -F -q -L "ROOTFS" -b 4096 -m 1 "${LOOP}p1"
+          MNT=$(mktemp -d)
+          sudo mount "${LOOP}p1" "${MNT}"
+          echo "▶ 正在写入 rootfs..."
+          sudo rsync -a "${ROOTFS_DIR}/" "${MNT}/"
+          sudo sync
+          sudo umount "${MNT}"
+          sudo losetup -d "${LOOP}"
+          rmdir "${MNT}"
+
+          echo "▶ 镜像写入完成: $(du -sh ${IMG_PATH})"
+          echo "img_path=${IMG_PATH}"   >> "${GITHUB_OUTPUT}"
+          echo "img_outdir=${IMG_DIR}"  >> "${GITHUB_OUTPUT}"
+          echo "status=success"         >> "${GITHUB_OUTPUT}"
+
+      # ── 5. Rebuild：注入内核 + uboot + 平台文件 ──────────────────────
+      - name: Rebuild image
+        id: rebuild
+        if: ${{ steps.pack.outputs.status == 'success' }}
+        env:
+          KERNEL:  ${{ inputs.armbian_kernel }}
+          FSTYPE:  ${{ inputs.armbian_fstype }}
+          BUILDER: ${{ inputs.builder_name }}
+        run: |
+          set -euo pipefail
+
+          sudo mv "${GITHUB_WORKSPACE}/rebuild" /builder/rebuild
+          sudo ln -sfn /builder/rebuild "${GITHUB_WORKSPACE}/rebuild"
+          sudo chown -R runner:runner /builder/rebuild
+          REBUILD_DIR="/builder/rebuild"
+
+          sudo chmod +x "${REBUILD_DIR}/rebuild"
+          cd "${REBUILD_DIR}"
+
+          echo "▶ 执行 rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 512/2500 -r ophub/kernel -n ${BUILDER}"
+          sudo ./rebuild \
+            -b ${BOARD} \
+            -k ${KERNEL} \
+            -a true \
+            -t ${FSTYPE} \
+            -s 512/2500 \
+            -r ophub/kernel \
+            -n ${BUILDER}
+
+          OUTPUT_DIR="${REBUILD_DIR}/build/output/images"
+          ls -lh "${OUTPUT_DIR}/"
+
+          PACKAGED_FILE="$(ls ${OUTPUT_DIR}/*.img.gz 2>/dev/null | head -1)"
+          [[ -z "${PACKAGED_FILE}" ]] && { echo "::error::rebuild 未生成 .img.gz"; exit 1; }
+
+          echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
+          echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
+
+      # ── 6. 发布 Release（含固件；模式 B 时同时追加 rootfs 说明）──────
+      - name: Upload firmware to Release
+        uses: ncipollo/release-action@main
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        with:
+          # 模式 A：新建 Release；模式 B：更新 build-rootfs 已创建的 Release
+          tag: >-
+            ${{ github.event.inputs.rootfs_url != '' &&
+              format('Build_{0}_{1}_{2}', inputs.ubuntu_release, inputs.armbian_kernel, github.run_number) ||
+              needs.build-rootfs.outputs.release_tag }}
+          name: "Ubuntu ${{ inputs.ubuntu_release }} · panther-x2 · ${{ inputs.armbian_kernel }} · #${{ github.run_number }}"
+          artifacts: "${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*"
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## Ubuntu ${{ inputs.ubuntu_release }} for panther-x2 (RK3566)
+
+            | 参数 | 值 |
+            |------|-----|
+            | Ubuntu 版本 | `${{ inputs.ubuntu_release }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
+            | 来源 rootfs | `${{ env.EFFECTIVE_ROOTFS_URL }}` |
+            | 构建者 | `${{ inputs.builder_name }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
+
+            ${{ github.event.inputs.rootfs_url == '' && '### RootFS\n\n本次固件所用的 rootfs 也已附在此 Release 中，下次构建可直接填入链接跳过编译。' || '' }}
