@@ -1,10 +1,3 @@
-#==========================================================================
-# 用途：构建 panther-x2 (RK3566) Ubuntu 固件
-#
-# 两种模式（自动判断）：
-#   A. 填写 rootfs_url → 直接用现有 rootfs 执行 rebuild（快，约 5 分钟）
-#   B. 不填 rootfs_url → 先构建 rootfs 再 rebuild，同时发布 rootfs + 固件
-#==========================================================================
 name: Build Ubuntu
 
 on:
@@ -22,6 +15,7 @@ on:
         type: choice
         options:
           - noble
+          - jammy
 
       armbian_kernel:
         description: "内核版本"
@@ -112,11 +106,19 @@ jobs:
           sudo -E apt-get clean
           sudo -E timedatectl set-timezone "${TZ}"
 
-          echo "UBUNTU_RELEASE=${{ inputs.ubuntu_release || 'noble' }}" >> "${GITHUB_ENV}"
-          echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"  >> "${GITHUB_ENV}"
+          UBUNTU_RELEASE="${{ inputs.ubuntu_release || 'noble' }}"
+          echo "UBUNTU_RELEASE=${UBUNTU_RELEASE}"                      >> "${GITHUB_ENV}"
+          echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}" >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname         || 'ubuntu' }}" >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
           echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"       >> "${GITHUB_ENV}"
+
+          # jammy / noble 专有标志
+          if [[ "${UBUNTU_RELEASE}" == "jammy" ]]; then
+            echo "IS_JAMMY=true"  >> "${GITHUB_ENV}"
+          else
+            echo "IS_JAMMY=false" >> "${GITHUB_ENV}"
+          fi
 
           # 判断模式
           ROOTFS_URL="${{ inputs.rootfs_url }}"
@@ -177,46 +179,92 @@ jobs:
           }
           trap cleanup EXIT
 
-          # ── apt 源（DEB822 格式）──────────────────────────────────────
-          sudo rm -f "${ROOTFS_DIR}/etc/apt/sources.list"
-          sudo tee "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources" > /dev/null << 'SOURCES_EOF'
+          # ── apt 源配置（按版本分支）──────────────────────────────────
+          if [[ "${IS_JAMMY}" == "true" ]]; then
+            # jammy (22.04)：使用传统 sources.list 格式
+            # DEB822 在 jammy 的 apt 版本（2.4.x）支持有限，稳定性不如传统格式
+            sudo rm -f "${ROOTFS_DIR}/etc/apt/sources.list.d/"*
+            sudo tee "${ROOTFS_DIR}/etc/apt/sources.list" > /dev/null << EOF
+          deb ${UBUNTU_MIRROR} jammy           main restricted universe multiverse
+          deb ${UBUNTU_MIRROR} jammy-updates   main restricted universe multiverse
+          deb ${UBUNTU_MIRROR} jammy-backports main restricted universe multiverse
+          deb ${UBUNTU_MIRROR} jammy-security  main restricted universe multiverse
+          EOF
+            sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apt/sources.list"
+          else
+            # noble (24.04)：使用 DEB822 格式
+            sudo rm -f "${ROOTFS_DIR}/etc/apt/sources.list"
+            sudo tee "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources" > /dev/null << 'SOURCES_EOF'
           Types: deb
           URIs: MIRROR_PLACEHOLDER
           Suites: RELEASE_PLACEHOLDER RELEASE_PLACEHOLDER-updates RELEASE_PLACEHOLDER-backports RELEASE_PLACEHOLDER-security
           Components: main restricted universe multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           SOURCES_EOF
-          sudo sed -i "s|MIRROR_PLACEHOLDER|${UBUNTU_MIRROR}|g"   "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
-          sudo sed -i "s|RELEASE_PLACEHOLDER|${UBUNTU_RELEASE}|g" "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
-          sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+            sudo sed -i "s|MIRROR_PLACEHOLDER|${UBUNTU_MIRROR}|g"   "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+            sudo sed -i "s|RELEASE_PLACEHOLDER|${UBUNTU_RELEASE}|g" "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+            sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+          fi
 
           # ── 安装基础包 ────────────────────────────────────────────────
+          # 注：bsdextrautils 在 jammy 已包含于 util-linux，无需单独安装
           echo "▶ 安装基础软件包..."
-          sudo chroot "${ROOTFS_DIR}" /bin/bash -c "
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y \
-              openssh-server sudo curl wget ca-certificates \
-              locales tzdata fdisk \
-              iproute2 network-manager netplan.io \
-              net-tools iputils-ping dnsutils \
-              wireless-tools chrony \
-              bash-completion htop nano nftables bc \
-              u-boot-tools initramfs-tools parted \
-              btrfs-progs e2fsprogs dosfstools \
-              lsof file procps cron ntpdate bsdextrautils \
-              wireless-regdb rsync \
-              --no-install-recommends
-            apt-get install -y wpasupplicant
-            apt-get install -y systemd-resolved --no-install-recommends
+          if [[ "${IS_JAMMY}" == "true" ]]; then
+            # jammy (22.04) 包列表
+            # - systemd-resolved 在 jammy 中是 systemd 的一部分，无需单独安装
+            # - nftables 在 jammy 中版本为 0.9.8，行为略有不同
+            # - wpasupplicant 需要先更新索引再安装（jammy debootstrap 后索引可能为空）
+            sudo chroot "${ROOTFS_DIR}" /bin/bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y \
+                openssh-server sudo curl wget ca-certificates \
+                locales tzdata fdisk \
+                iproute2 network-manager netplan.io \
+                net-tools iputils-ping dnsutils \
+                wireless-tools chrony \
+                bash-completion htop nano nftables bc \
+                u-boot-tools initramfs-tools parted \
+                btrfs-progs e2fsprogs dosfstools \
+                lsof file procps cron ntpdate \
+                wireless-regdb rsync wpasupplicant \
+                --no-install-recommends
 
-            # 验证关键包
-            dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
-              echo 'ERROR: 关键包安装不完整'
-              exit 1
-            }
-            apt-get clean && rm -rf /var/lib/apt/lists/*
-          "
+              # 验证关键包（jammy 下 systemd-resolved 内嵌于 systemd）
+              dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
+                echo 'ERROR: 关键包安装不完整'
+                exit 1
+              }
+              apt-get clean && rm -rf /var/lib/apt/lists/*
+            "
+          else
+            # noble (24.04) 包列表（含 bsdextrautils、systemd-resolved 独立包）
+            sudo chroot "${ROOTFS_DIR}" /bin/bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y \
+                openssh-server sudo curl wget ca-certificates \
+                locales tzdata fdisk \
+                iproute2 network-manager netplan.io \
+                net-tools iputils-ping dnsutils \
+                wireless-tools chrony \
+                bash-completion htop nano nftables bc \
+                u-boot-tools initramfs-tools parted \
+                btrfs-progs e2fsprogs dosfstools \
+                lsof file procps cron ntpdate bsdextrautils \
+                wireless-regdb rsync \
+                --no-install-recommends
+              apt-get install -y wpasupplicant
+              apt-get install -y systemd-resolved --no-install-recommends
+
+              # 验证关键包
+              dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
+                echo 'ERROR: 关键包安装不完整'
+                exit 1
+              }
+              apt-get clean && rm -rf /var/lib/apt/lists/*
+            "
+          fi
 
           # ── 额外包（可选）────────────────────────────────────────────
           if [[ -n "${EXTRA_PKGS}" ]]; then
@@ -266,7 +314,12 @@ jobs:
           sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager
           sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager-dispatcher
           sudo chroot "${ROOTFS_DIR}" systemctl enable chrony
-          sudo chroot "${ROOTFS_DIR}" systemctl enable nftables         2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl enable nftables 2>/dev/null || true
+
+          # ── systemd-resolved 启用（jammy 与 noble 行为一致，但来源不同）
+          # jammy: systemd-resolved 内嵌于 systemd 包，单元文件已存在
+          # noble: systemd-resolved 作为独立包安装
+          sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-resolved.service
 
           # ── Ubuntu 特有：禁用 snapd / unattended-upgrades ────────────
           sudo chroot "${ROOTFS_DIR}" bash -c "
@@ -275,6 +328,27 @@ jobs:
             systemctl disable unattended-upgrades.service 2>/dev/null || true
             systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
           "
+
+          # ── jammy 额外处理 ────────────────────────────────────────────
+          if [[ "${IS_JAMMY}" == "true" ]]; then
+            # 22.04 上 motd-news 会在启动时联网请求，嵌入式场景下禁用
+            sudo chroot "${ROOTFS_DIR}" bash -c "
+              systemctl disable motd-news.timer 2>/dev/null || true
+              systemctl disable motd-news.service 2>/dev/null || true
+            "
+            # 22.04 上 multipathd 可能被自动拉起，嵌入式不需要
+            sudo chroot "${ROOTFS_DIR}" bash -c "
+              systemctl disable multipathd.service 2>/dev/null || true
+              systemctl disable multipathd.socket  2>/dev/null || true
+            "
+            # 22.04 cloud-init（debootstrap 有时会拉入）
+            sudo chroot "${ROOTFS_DIR}" bash -c "
+              systemctl disable cloud-init.service 2>/dev/null || true
+              systemctl disable cloud-init-local.service 2>/dev/null || true
+              systemctl disable cloud-config.service 2>/dev/null || true
+              systemctl disable cloud-final.service 2>/dev/null || true
+            " || true
+          fi
 
           # ── systemd 超时 ──────────────────────────────────────────────
           SYS_CONF="${ROOTFS_DIR}/etc/systemd/system.conf"
@@ -324,13 +398,12 @@ jobs:
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-resize-filesystem.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-zram-config.service
           sudo chroot "${ROOTFS_DIR}" systemctl enable ubuntu-ramlog.service
-          sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-resolved.service
 
           # ── disable 不需要的服务 ──────────────────────────────────────
-          sudo chroot "${ROOTFS_DIR}" systemctl disable networking.service                2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl disable networking.service                 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service              2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service            2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service               2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service             2>/dev/null || true
 
           # ── uInitrd 钩子 ──────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/initramfs/post-update.d"
@@ -476,6 +549,7 @@ jobs:
 
           echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
           echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
+
 
       # ── 6A. 发布固件 + rootfs（自建模式）────────────────────────────
       - name: Release firmware + rootfs
